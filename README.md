@@ -145,6 +145,10 @@ things that go wrong otherwise: `FORCE_CUDA=1`, without which a build on a
 GPU-less login node silently produces a CPU-only extension, and
 `TORCH_CUDA_ARCH_LIST`, since there is no GPU there to detect. `Matcher` checks
 for both failure modes at construction and refuses a missing or CPU-only build.
+The script also patches the kernel's launch geometry for Blackwell GPUs: upstream
+has no block-size entry for compute capability 10, so a B200 fell back to 128
+threads per block and left almost half of its SMs idle during the solve. 32 was
+measured fastest there, with identical assignments.
 
 ## 🌟 Activating the Environment
 

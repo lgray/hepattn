@@ -30,6 +30,9 @@
 #   export LD_LIBRARY_PATH=$CONDA_PREFIX/lib      # the extension links the environment's libstdc++
 #
 # then set `device_solver: jv` on the Matcher in the config.
+#
+# The upstream source is patched before building to give the CUDA kernel a launch block size
+# for Blackwell GPUs (B200); see the comment at the patch below.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -48,6 +51,45 @@ if [ ! -d "$TARGET/.git" ]; then
   git clone --quiet "$UPSTREAM" "$TARGET"
 fi
 git -C "$TARGET" checkout --quiet "$COMMIT"
+
+# Give SMPCores() a Blackwell case. Upstream's switch covers compute-capability majors 2-9, so
+# a B200 (major 10) falls through to its "unknown device" launch block size of 128 threads. The
+# kernel runs one thread per problem, and at 128 a CLIC step's ~10k problems make 80 blocks for
+# the B200's 148 SMs, leaving almost half the GPU without work; 32 makes 320 blocks and was the
+# fastest block size measured on a B200 (a ~10% faster solve, +4.4% end-to-end training
+# throughput), with bit-identical assignments at every block size from 32 to 512. Ada (L4)
+# keeps its 128. Applied here rather than carried as a fork so this script is the single
+# statement of what differs from upstream; the assertion fails loudly if the upstream source
+# ever changes underneath it.
+python - "$TARGET/src/torch_linear_assignment_cuda_kernel.cu" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+src = path.read_text()
+old = """  case 9: // Hopper
+    if (devProp.minor == 0) return 128;
+    break;
+  }
+  return 128; // Unknown device"""
+new = """  case 9: // Hopper
+    if (devProp.minor == 0) return 128;
+    break;
+  case 10: // Blackwell (B100 / B200 / GB200)
+    // Deliberately not the 128 FP32 cores a Blackwell SM has: the one caller of this function
+    // uses the result as the launch block size, and 32 is what was measured to be fastest on a
+    // B200, where 128 leaves almost half of the 148 SMs without a block to run.
+    return 32;
+  }
+  return 128; // Unknown device"""
+if src.count(new) == 1:
+    print("SMPCores() already has the Blackwell case")
+    sys.exit(0)
+assert src.count(old) == 1, "SMPCores() tail not found exactly once: upstream source changed, review the patch"
+path.write_text(src.replace(old, new))
+print("patched SMPCores(): compute capability 10 -> block size 32")
+PY
+
 rm -rf "$TARGET/build"
 find "$TARGET" -name '*.so' -delete
 
