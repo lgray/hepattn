@@ -12,7 +12,20 @@ import scipy
 import torch
 from torch import nn
 
+from hepattn.models.device_lap import assignment_to_permutation, batched_jv, require_jv
 from hepattn.utils.import_utils import check_import_safe
+
+# Solvers that run on whichever device the costs are already on, rather than on the host.
+# Opt-in via Matcher(device_solver=...); see the module docstring of hepattn.models.device_lap.
+DEVICE_SOLVERS = {
+    "jv": batched_jv,
+}
+
+# Device solvers that need a compiled dependency check for it here, so a missing or CPU-only
+# build fails at construction with a build recipe rather than mid-training, or worse, quietly.
+DEVICE_SOLVER_CHECKS = {
+    "jv": require_jv,
+}
 
 _POOL_LOCK = Lock()
 _THREAD_POOLS: dict[int, ThreadPool] = {}
@@ -211,6 +224,7 @@ class Matcher(nn.Module):
         parallel_solver: bool = False,
         parallel_backend: Literal["thread", "process"] = "thread",
         n_jobs: int = 8,
+        device_solver: str | None = None,
         verbose: bool = False,
     ):
         super().__init__()
@@ -232,6 +246,14 @@ class Matcher(nn.Module):
             Parallel backend when parallel_solver is True. One of: 'thread', 'process'.
         n_jobs: int
             Number of jobs to use for parallel matching. Only used if parallel_solver is True.
+        device_solver : str | None
+            If set, solve on whichever device the costs already live on instead of copying
+            them to the host, which removes the device-to-host transfer and the host stall
+            that goes with it. Currently 'jv' (exact Jonker-Volgenant, needs the compiled
+            torch-linear-assignment extension; see hepattn.models.device_lap). Defaults to
+            None, i.e. the host solvers above. Worth turning on only when training is
+            host-bound: on a GPU that is already saturated the solver's own kernels cost more
+            than the stall they remove.
         verbose : bool
             If true, extra information on solver timing is printed.
         """
@@ -239,6 +261,12 @@ class Matcher(nn.Module):
             raise ValueError(f"Unknown solver: {default_solver}. Available solvers: {list(SOLVERS.keys())}")
         if parallel_backend not in {"thread", "process"}:
             raise ValueError(f"parallel_backend must be 'thread' or 'process', got: {parallel_backend}")
+        if device_solver is not None:
+            if device_solver not in DEVICE_SOLVERS:
+                raise ValueError(f"Unknown device solver: {device_solver}. Available device solvers: {list(DEVICE_SOLVERS.keys())}")
+            check = DEVICE_SOLVER_CHECKS.get(device_solver)
+            if check is not None:
+                check()
         if default_solver.startswith("lap1015") and parallel_solver and parallel_backend == "thread" and not _lap1015_releases_gil():
             warnings.warn(
                 f"The installed lap1015 extension does not release the GIL while solving, so the '{default_solver}' solver "
@@ -254,6 +282,7 @@ class Matcher(nn.Module):
         self.parallel_solver = parallel_solver
         self.parallel_backend = parallel_backend
         self.n_jobs = n_jobs
+        self.device_solver = device_solver
         self.step = 0
         self.verbose = verbose
         self._pinned_buffer = None
@@ -300,16 +329,55 @@ class Matcher(nn.Module):
         if not costs_t.is_cuda:
             return costs_t.numpy(), lengths_np
 
-        # Stage the copy through a cached pinned buffer: a device->pageable memcpy of the
-        # cost tensor is several times slower than device->pinned, and profiling showed it
-        # dominating the matcher cost. Grow-only so allocation (expensive for pinned
-        # memory) happens rarely.
+        return self._stage_to_host(costs_t), lengths_np
+
+    def _stage_to_host(self, costs_t: torch.Tensor) -> np.ndarray:
+        """Copy a prepared device cost tensor to the host, staged through a pinned buffer.
+
+        A device->pageable memcpy of the cost tensor is several times slower than
+        device->pinned, and profiling showed it dominating the matcher cost. The buffer is
+        cached and grow-only, so allocation (expensive for pinned memory) happens rarely.
+
+        Kept as its own method because it is the single transfer the device solver exists to
+        remove, which makes it the natural thing to put a timer around.
+        """
         n = costs_t.numel()
         if self._pinned_buffer is None or self._pinned_buffer.numel() < n:
             self._pinned_buffer = torch.empty(n, dtype=torch.float32, pin_memory=True)
         staged = self._pinned_buffer[:n].view(costs_t.shape)
         staged.copy_(costs_t)
-        return staged.numpy(), lengths_np
+        return staged.numpy()
+
+    def _match_on_device(self, costs, object_valid_mask=None, query_valid_mask=None) -> torch.Tensor:
+        """Match without ever leaving the device the costs are on.
+
+        This is the same preparation as :meth:`_prepare_costs` minus everything that only
+        exists to serve a host solver: there is no sentinel fill (the device solver treats
+        non-finite and disallowed entries as forbidden directly), no pinned staging buffer and
+        no ``.numpy()``. The one host round trip left is reading ``max(num_valid_targets)`` to
+        crop the padded target rows, which is four bytes against the ~1 GB the host path moves.
+
+        Returns:
+            [batch, num_pred] permutation tensor, on the costs' device.
+        """
+        costs = costs.detach().to(torch.float32)
+        batch, num_pred, num_true = costs.shape
+
+        if object_valid_mask is None:
+            lengths = torch.full((batch,), num_true, dtype=torch.long, device=costs.device)
+        else:
+            lengths = object_valid_mask.detach().bool().to(costs.device).sum(dim=1)
+
+        max_len = int(lengths.max()) if batch else 0
+        costs_t = costs.transpose(1, 2)[:, :max_len].contiguous()
+
+        col_allowed = None if query_valid_mask is None else query_valid_mask.detach().bool().to(costs.device)
+        row_valid = torch.arange(max_len, device=costs.device)[None, :] < lengths[:, None]
+
+        # The solver is exact and cannot come back short, so there is nothing to check and no
+        # reason to stall the host on the result -- which is the point of the device path.
+        assigned = DEVICE_SOLVERS[self.device_solver](costs_t, row_valid, col_allowed)
+        return assignment_to_permutation(assigned, lengths, num_pred)
 
     def _solve(self, costs_t: np.ndarray, lengths_np: np.ndarray, pred_dim: int) -> torch.Tensor:
         """Run the LAP solver over a prepared [batch, max_true, num_pred] host array."""
@@ -328,12 +396,22 @@ class Matcher(nn.Module):
         if not isinstance(costs, torch.Tensor):
             costs = torch.from_numpy(np.asarray(costs))
 
+        if self.device_solver is not None:
+            return self._match_on_device(costs, object_valid_mask, query_valid_mask)
+
         costs_t, lengths_np = self._prepare_costs(costs, object_valid_mask, query_valid_mask)
 
         return self._solve(costs_t, lengths_np, costs.shape[1])
 
     @torch.no_grad()
     def forward(self, costs, object_valid_mask=None, query_valid_mask=None):
+        # The device path bypasses solver adaptation: the host solvers it would be timed
+        # against are on the other side of the transfer this exists to avoid.
+        if self.device_solver is not None:
+            pred_idxs = self._match_on_device(costs, object_valid_mask, query_valid_mask)
+            self.step += 1
+            return pred_idxs
+
         pred_dim = costs.shape[1]
         costs_t, lengths_np = self._prepare_costs(costs, object_valid_mask, query_valid_mask)
 

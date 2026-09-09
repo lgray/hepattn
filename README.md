@@ -111,6 +111,41 @@ looks like the obvious fix. Its import-time rebuild runs under the system `cmake
 which cannot find the Python development headers, so it turns a stale extension
 into an unimportable one. Rebuild explicitly instead.
 
+### Optional: solving the matching on the GPU
+
+By default the Hungarian matching runs on the host: the cost matrices are copied
+device-to-host and solved across a thread pool. On a GPU that the model does not
+saturate, the training step is host-bound and that copy plus solve dominates it.
+For that case the `Matcher` has an opt-in device solver, an exact batched
+Jonker-Volgenant (`torch-linear-assignment`) that solves in place on the GPU:
+
+```yaml
+matcher:
+  class_path: hepattn.models.matcher.Matcher
+  init_args:
+    device_solver: jv
+```
+
+It is off by default and only worth turning on when training is host-bound. On a
+GPU that is already busy the solver's own kernels cost more than the stall they
+remove, so measure before adopting it. Its results are exact, as the host solvers'
+are; the two are held to equal total assignment cost in
+`tests/matching/test_device_solver.py`.
+
+The backend is a CUDA extension that must be compiled against the environment's
+torch, for the GPU it will run on, so it is not a pixi dependency. Build it with
+
+```shell
+pixi run bash setup/build_torch_linear_assignment.sh
+```
+
+and follow the instructions it prints (put the build on `PYTHONPATH`, with
+`LD_LIBRARY_PATH` pointing at the environment's `lib`). The script sets the two
+things that go wrong otherwise: `FORCE_CUDA=1`, without which a build on a
+GPU-less login node silently produces a CPU-only extension, and
+`TORCH_CUDA_ARCH_LIST`, since there is no GPU there to detect. `Matcher` checks
+for both failure modes at construction and refuses a missing or CPU-only build.
+
 ## 🌟 Activating the Environment
 
 To run the installed environment, use:

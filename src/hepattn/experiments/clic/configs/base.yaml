@@ -146,6 +146,9 @@ model:
           adaptive_solver: false
           parallel_solver: true
           n_jobs: 16
+          # Opt-in GPU solver, worth it only when training is host-bound (e.g. one B200):
+          # needs the torch-linear-assignment build from setup/build_torch_linear_assignment.sh.
+          # device_solver: jv
 
       tasks:
         class_path: torch.nn.ModuleList
