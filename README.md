@@ -63,6 +63,54 @@ pixi install --locked
 See the [pyproject.toml](pyproject.toml) or [setup/isambard.md](setup/isambard.md)
 for more information.
 
+### The `lap1015` Extension
+
+The `lap1015` linear assignment solver is a C++ extension vendored in
+[`src/lap1015`](src/lap1015) and compiled from that source by `pixi install`. It
+must be built from *this* repository's source, and not from an older or upstream
+build, because only this version releases the GIL while solving. Without that, the
+threaded matcher serialises: `Matcher(parallel_solver=True, n_jobs=16)` quietly runs
+sixteen threads that all queue behind each other, and the CLIC default
+`lap1015_late` solver ends up roughly 2x slower than `scipy`.
+
+**Check your build in one line:**
+
+```shell
+pixi run python -c "import lap1015; print(lap1015.releases_gil)"
+```
+
+`True` is what you want. The flag is set at **compile** time, so it reports how the
+binary was produced rather than how it behaves: an extension patched in place rather
+than rebuilt reports `False` even if it does release the GIL, and either way the fix
+is the same.
+
+**To rebuild:**
+
+```shell
+pixi reinstall hepattn
+```
+
+This recompiles the extension from `src/lap1015/src/main.cpp`. A plain `pixi install`
+will *not* do it if the environment already exists — pixi sees the package version
+unchanged and skips it, which is how a build can sit stale across edits to the C++
+source.
+
+Two things guard this, and are worth knowing about if you change the build:
+
+- `strict-config = false` in [pyproject.toml](pyproject.toml) lets the build
+  tolerate the `pixi-conda-environment` config-setting that pixi passes to the
+  backend. Without it, scikit-build-core rejects the unknown option and
+  `pixi install` fails outright on a fresh clone with
+  `Unrecognized options in config-settings`.
+- `tests/matching/test_solvers.py::test_lap1015_releases_gil` fails if the
+  installed extension holds the GIL, so a stale build is caught by the test suite
+  rather than by a warning nobody reads.
+
+Note that scikit-build-core's `editable.rebuild = true` is *not* used, though it
+looks like the obvious fix. Its import-time rebuild runs under the system `cmake`,
+which cannot find the Python development headers, so it turns a stale extension
+into an unimportable one. Rebuild explicitly instead.
+
 ## 🌟 Activating the Environment
 
 To run the installed environment, use:
