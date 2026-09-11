@@ -36,5 +36,5 @@ PYTORCH_CMD="python main.py test \
 
 echo "Running: $PYTORCH_CMD"
 apptainer run --nv --bind /blue/,/cmsuf/ /path/to/hepattn/pixi.sif \
-  pixi run $PYTORCH_CMD
+  pixi run -e clic $PYTORCH_CMD
 echo "Done!"

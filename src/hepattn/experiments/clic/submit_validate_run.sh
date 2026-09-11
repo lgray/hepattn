@@ -63,6 +63,6 @@ PYTORCH_CMD="python main.py validate \
   --ckpt_path $CKPT"
 
 apptainer run --nv --bind /blue/,/cmsuf/ \
-  /path/to/hepattn/pixi.sif pixi run $PYTORCH_CMD
+  /path/to/hepattn/pixi.sif pixi run -e clic $PYTORCH_CMD
 
 echo "Done!"
