@@ -86,6 +86,10 @@ pixi shell -e clic
 python main.py fit --config configs/base.yaml --trainer.devices=1
 ```
 
+The submit scripts run in the `default` environment (`pixi run`); the `clic`
+environment is a superset of it that adds the analysis packages, so training works in
+either, and the performance notebooks need `clic`.
+
 ### Optional: solve the matching on the GPU
 
 A single B200 is not saturated by the CLIC model, so the training step there is
